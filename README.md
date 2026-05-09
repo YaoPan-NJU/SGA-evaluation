@@ -48,22 +48,27 @@ export MIMO_API_KEY="your-api-key-here"
 
 ### 3. 测试连接
 ```bash
-python scripts/test_api.py
+python3 scripts/test_api.py
 ```
 
 ### 4. 解析原始MD文件（如未执行）
 ```bash
-python scripts/parse_schemes.py
+python3 scripts/parse_schemes.py --input-dir 00_raw_md
 ```
 
-### 5. 开始批量评分
+### 5. 重建任务队列（如需重置）
 ```bash
-python scripts/api_scoring.py
+python3 scripts/generate_task_queue.py --status pending
 ```
 
-### 6. 生成最终输出
+### 6. 开始批量评分
 ```bash
-python scripts/generate_output.py
+python3 scripts/api_scoring.py
+```
+
+### 7. 生成最终输出
+```bash
+python3 scripts/generate_output.py
 ```
 
 ## 📁 项目结构
@@ -90,6 +95,7 @@ scoring_project/
 │
 └── scripts/
     ├── parse_schemes.py          # MD文件解析
+    ├── generate_task_queue.py    # 任务队列生成/重置
     ├── test_api.py               # API连接测试
     ├── api_scoring.py            # 批量评分主脚本
     └── generate_output.py        # 生成Excel和Markdown
@@ -104,7 +110,7 @@ scoring_project/
 
 ### 评分参数
 - **Temperature**: 0.3（确保输出稳定）
-- **Max tokens**: 2000
+- **Max tokens**: 4000
 - **重试次数**: 3次
 - **调用间隔**: 2秒（避免限流）
 
@@ -112,6 +118,8 @@ scoring_project/
 
 ```
 原始MD文件 → parse_schemes.py → 03_schemes_data/
+                                    ↓
+                    generate_task_queue.py → 01_task_queue.json
                                     ↓
                     api_scoring.py + mimo API → 04_scoring_results/
                                                     ↓
@@ -123,7 +131,12 @@ scoring_project/
 ### parse_schemes.py
 从原始MD文件（A-F.md）中提取JSON方案数据。
 - 自动修复JSON括号不平衡问题
-- 输出到 `03_schemes_data/`
+- 默认从项目根目录下的 `00_raw_md/` 读取，输出到 `03_schemes_data/`
+
+### generate_task_queue.py
+从 `03_schemes_data/` 重新生成 `01_task_queue.json`。
+- 默认生成60个 `pending` 任务
+- `run_id` 直接来自对应方案JSON，避免队列与方案数据不匹配
 
 ### test_api.py
 测试mimo API连接和认证。
@@ -135,6 +148,8 @@ scoring_project/
 - 调用API进行深度分析
 - 保存评分结果并更新任务队列
 - 自动容错和重试
+- 校验模型返回的分数、理由步骤引用、加权总分和等级
+- 失败任务会写回 `failed` 状态和错误信息
 
 ### generate_output.py
 汇总所有评分结果，生成：
@@ -150,7 +165,7 @@ $json = Get-Content 01_task_queue.json | ConvertFrom-Json
 ($json.task_queue | Where-Object { $_.status -eq 'completed' }).Count
 
 # Linux/Mac
-python -c "import json; data=json.load(open('01_task_queue.json')); print(len([t for t in data['task_queue'] if t['status']=='completed']))"
+python3 -c "import json; data=json.load(open('01_task_queue.json')); print(len([t for t in data['task_queue'] if t['status']=='completed']))"
 ```
 
 ## ⚠️ 注意事项

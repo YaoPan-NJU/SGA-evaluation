@@ -3,50 +3,79 @@ API评分脚本 - 调用小米mimo-v2.5-pro进行深度化学推理评分
 """
 import json
 import os
+import re
 import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict
+
 import requests
-from typing import Dict, Any
 from dotenv import load_dotenv
 
-# 加载.env文件（如果存在）
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCHEMES_DATA_DIR = PROJECT_ROOT / "03_schemes_data"
+RESULTS_DIR = PROJECT_ROOT / "04_scoring_results"
+TASK_QUEUE_FILE = PROJECT_ROOT / "01_task_queue.json"
+
+DIMENSIONS = ["D1", "D2", "D3", "D4", "D5", "D6"]
+WEIGHTS = {"D1": 25, "D2": 25, "D3": 20, "D4": 10, "D5": 10, "D6": 10}
+
+# 加载项目根目录下的.env文件（如果存在）
+load_dotenv(PROJECT_ROOT / ".env")
 
 # API配置
 API_BASE_URL = os.environ.get("MIMO_API_BASE_URL", "https://token-plan-ams.xiaomimimo.com/v1")
 API_MODEL = os.environ.get("MIMO_API_MODEL", "mimo-v2.5-pro")
-API_KEY = os.environ.get("MIMO_API_KEY", "")  # 从环境变量或.env文件读取
+API_KEY = os.environ.get("MIMO_API_KEY", "")
+API_TEMPERATURE = float(os.environ.get("MIMO_API_TEMPERATURE", "0.3"))
+API_MAX_TOKENS = int(os.environ.get("MIMO_API_MAX_TOKENS", "4000"))
+API_INTERVAL_SECONDS = float(os.environ.get("MIMO_API_INTERVAL_SECONDS", "2"))
+
+
+def format_steps(steps: list[dict]) -> str:
+    if not steps:
+        return "无"
+
+    lines = []
+    for step in steps:
+        step_no = step.get("step", "N/A")
+        description = step.get("description", "")
+        temperature = step.get("temperature", "N/A")
+        duration = step.get("duration", "N/A")
+        lines.append(
+            f"Step {step_no}: {description}\n"
+            f"  - 温度: {temperature}\n"
+            f"  - 时间: {duration}"
+        )
+    return "\n".join(lines)
+
+
+def format_mapping(mapping: dict) -> str:
+    if not mapping:
+        return "无"
+    return "\n".join(f"- {key}: {value}" for key, value in mapping.items())
+
+
+def format_list(items: list) -> str:
+    if not items:
+        return "无"
+    return "\n".join(f"- {item}" for item in items)
+
 
 def build_scoring_prompt(scheme_data: Dict[str, Any], scheme_id: str) -> str:
     """
-    构建详细的化学推理评分prompt
-    
-    Args:
-        scheme_data: 方案的JSON数据
-        scheme_id: 方案ID (如 "D-03")
-    
-    Returns:
-        完整的prompt文本
+    构建详细的化学推理评分prompt。
     """
-    proposal = scheme_data['proposal']
-    run_id = scheme_data['run_id']
-    
-    # 提取关键信息
-    steps = proposal.get('steps', [])
-    raw_materials = proposal.get('raw_materials', [])
-    key_parameters = proposal.get('key_parameters', {})
-    equipment = proposal.get('equipment', [])
-    safety_notes = proposal.get('safety_notes', [])
-    rationale = proposal.get('rationale', '')
-    
-    # 构建步骤描述
-    steps_text = "\n".join([
-        f"Step {s['step']}: {s['description'][:200]}{'...' if len(s['description']) > 200 else ''} (温度: {s.get('temperature', 'N/A')}, 时间: {s.get('duration', 'N/A')})"
-        for s in steps
-    ])
-    
-    # 构建关键参数
-    params_text = ", ".join([f"{k}: {v}" for k, v in key_parameters.items()]) if key_parameters else "无"
-    
+    proposal = scheme_data["proposal"]
+    run_id = scheme_data["run_id"]
+
+    steps = proposal.get("steps", [])
+    raw_materials = proposal.get("raw_materials", [])
+    key_parameters = proposal.get("key_parameters", {})
+    equipment = proposal.get("equipment_required") or proposal.get("equipment", [])
+    safety_notes = proposal.get("safety_notes", [])
+    rationale = proposal.get("rationale", "")
+
     prompt = f"""你是一个专业的材料化学专家，请对以下材料合成方案进行严格的李克特量表评分（v1版本，6维度加权评分）。
 
 ## 方案信息
@@ -54,19 +83,22 @@ def build_scoring_prompt(scheme_data: Dict[str, Any], scheme_id: str) -> str:
 **Run ID**: {run_id}
 
 ## 合成路线设计理由
-{rationale[:500] if rationale else '无'}
+{rationale if rationale else '无'}
 
 ## 合成步骤
-{steps_text}
+{format_steps(steps)}
 
 ## 原料清单
-{', '.join(raw_materials) if raw_materials else '无'}
+{format_list(raw_materials)}
 
 ## 关键参数
-{params_text}
+{format_mapping(key_parameters)}
+
+## 设备要求
+{format_list(equipment)}
 
 ## 安全注意事项
-{'; '.join(safety_notes) if safety_notes else '无'}
+{format_list(safety_notes)}
 
 ## 评分任务
 
@@ -138,7 +170,7 @@ def build_scoring_prompt(scheme_data: Dict[str, Any], scheme_id: str) -> str:
 **评估标准**：
 - 9-10分：路线使用足够简单适当的方法，设备负担低，放大潜力好
 - 7-8分：路线复杂度中等，但复杂性主要由目标结构论证
-- 5-6分：路线somewhat复杂，某些步骤可简化或替换
+- 5-6分：路线偏复杂，某些步骤可简化或替换
 - 3-4分：路线过度工程化；高温、高压、惰性气氛或专用步骤缺乏论证
 - 1-2分：路线复杂度与目标材料严重不匹配
 
@@ -183,253 +215,291 @@ def build_scoring_prompt(scheme_data: Dict[str, Any], scheme_id: str) -> str:
     "D4": "<具体理由，必须引用具体步骤编号和参数，说明化学原理，1-3句话>",
     "D5": "<具体理由，必须引用具体步骤编号和参数，说明化学原理，1-3句话>",
     "D6": "<具体理由，必须引用具体步骤编号和参数，说明化学原理，1-3句话>"
-  }},
-  "weighted_total": <浮点数，计算公式: 25*(D1/10) + 25*(D2/10) + 20*(D3/10) + 10*(D4/10) + 10*(D5/10) + 10*(D6/10)>,
-  "grade": "<A/B+/B/C/D，A≥85, B+=75-84, B=65-74, C=55-64, D<55>"
+  }}
 }}
 ```
 
 **重要要求**：
-1. 每个维度的理由必须引用具体步骤编号（如"Step 2"）
+1. 每个维度的理由必须引用具体步骤编号（如"Step 2"或"步骤2"）
 2. 每个维度的理由必须说明化学原理（如"碱性条件使氨基去质子化促进SN2反应"）
 3. 不能使用"反应化学成熟"、"工艺参数合理"等通用套话
 4. 分数必须严格对照量表的5级描述
-5. 只输出JSON，不要输出其他内容
+5. 不要照抄既有文字；必须基于本方案的步骤、参数、原料和安全信息逐项推理
+6. 只输出JSON，不要输出其他内容
 """
-    
     return prompt
+
+
+def extract_json(content: str) -> Dict[str, Any]:
+    """从模型响应中提取JSON对象。"""
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        return json.loads(fenced.group(1))
+
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise json.JSONDecodeError("响应中未找到JSON对象", content, 0)
+
+    return json.loads(content[start:end + 1])
 
 
 def call_mimo_api(prompt: str, max_retries: int = 3) -> Dict[str, Any]:
     """
-    调用小米mimo API
-    
-    Args:
-        prompt: 评分prompt
-        max_retries: 最大重试次数
-    
-    Returns:
-        API返回的JSON数据
+    调用小米mimo API，并解析JSON响应。
     """
     if not API_KEY:
         raise ValueError("MIMO_API_KEY环境变量未设置，请先设置API密钥")
-    
+
     headers = {
         "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
-    
+
     payload = {
         "model": API_MODEL,
         "messages": [
             {
                 "role": "system",
-                "content": "你是材料化学专家，擅长材料合成方案的化学推理和评估。请严格按照用户要求进行分析，只输出JSON格式的结果。"
+                "content": "你是材料化学专家，擅长材料合成方案的化学推理和评估。请严格按照用户要求逐项分析，只输出JSON格式的结果。",
             },
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt},
         ],
-        "temperature": 0.3,  # 较低温度确保输出稳定
-        "max_tokens": 2000
+        "temperature": API_TEMPERATURE,
+        "max_tokens": API_MAX_TOKENS,
     }
-    
+
+    last_content = ""
     for attempt in range(max_retries):
         try:
             response = requests.post(
                 f"{API_BASE_URL}/chat/completions",
                 headers=headers,
                 json=payload,
-                timeout=120  # 2分钟超时
+                timeout=120,
             )
             response.raise_for_status()
-            
-            result = response.json()
-            content = result['choices'][0]['message']['content']
-            
-            # 提取JSON（可能包含markdown代码块）
-            if '```json' in content:
-                json_str = content.split('```json')[1].split('```')[0].strip()
-            elif '```' in content:
-                json_str = content.split('```')[1].split('```')[0].strip()
-            else:
-                json_str = content.strip()
-            
-            return json.loads(json_str)
-            
+
+            api_result = response.json()
+            last_content = api_result["choices"][0]["message"]["content"]
+            return extract_json(last_content)
+
         except requests.exceptions.RequestException as e:
-            print(f"  ⚠️ API调用失败 (尝试 {attempt+1}/{max_retries}): {e}")
+            print(f"  ⚠️ API调用失败 (尝试 {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
-                time.sleep(5 * (attempt + 1))  # 递增等待
+                time.sleep(5 * (attempt + 1))
             else:
                 raise
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"  ⚠️ 解析API响应失败 (尝试 {attempt+1}/{max_retries}): {e}")
-            print(f"  原始内容: {content[:200]}...")
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            print(f"  ⚠️ 解析API响应失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if last_content:
+                print(f"  原始内容片段: {last_content[:300]}...")
             if attempt < max_retries - 1:
                 time.sleep(2)
             else:
                 raise
-    
-    # 不应到达这里，但为了类型安全
+
     raise RuntimeError(f"API调用失败：已重试{max_retries}次")
 
 
-def score_single_scheme(scheme_data: Dict[str, Any], scheme_id: str, output_dir: str) -> Dict[str, Any]:
+def calculate_weighted_total(scores: Dict[str, int]) -> float:
+    return round(sum(WEIGHTS[dim] * (scores[dim] / 10) for dim in DIMENSIONS), 2)
+
+
+def calculate_grade(weighted_total: float) -> str:
+    if weighted_total >= 85:
+        return "A"
+    if weighted_total >= 75:
+        return "B+"
+    if weighted_total >= 65:
+        return "B"
+    if weighted_total >= 55:
+        return "C"
+    return "D"
+
+
+def has_step_reference(reason: str) -> bool:
+    return bool(re.search(r"\bStep\s*\d+\b|步骤\s*\d+", reason, re.IGNORECASE))
+
+
+def validate_and_normalize_result(result: Dict[str, Any], scheme_id: str) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        raise ValueError("API返回结果不是JSON对象")
+    if not isinstance(result.get("scores"), dict):
+        raise ValueError("API返回数据格式错误：缺少scores对象")
+    if not isinstance(result.get("reasons"), dict):
+        raise ValueError("API返回数据格式错误：缺少reasons对象")
+
+    normalized_scores = {}
+    normalized_reasons = {}
+
+    for dim in DIMENSIONS:
+        if dim not in result["scores"]:
+            raise ValueError(f"scores缺少{dim}")
+        score = result["scores"][dim]
+        if isinstance(score, float) and score.is_integer():
+            score = int(score)
+        if not isinstance(score, int) or not 1 <= score <= 10:
+            raise ValueError(f"{dim}分数必须是1-10整数，当前值: {score!r}")
+        normalized_scores[dim] = score
+
+        reason = result["reasons"].get(dim)
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError(f"reasons缺少{dim}或理由为空")
+        if not has_step_reference(reason):
+            raise ValueError(f"{dim}理由未引用具体步骤编号")
+        normalized_reasons[dim] = reason.strip()
+
+    weighted_total = calculate_weighted_total(normalized_scores)
+    grade = calculate_grade(weighted_total)
+
+    result["scores"] = normalized_scores
+    result["reasons"] = normalized_reasons
+    result["weighted_total"] = weighted_total
+    result["grade"] = grade
+    result["calculation"] = (
+        f"25×{normalized_scores['D1']/10} + "
+        f"25×{normalized_scores['D2']/10} + "
+        f"20×{normalized_scores['D3']/10} + "
+        f"10×{normalized_scores['D4']/10} + "
+        f"10×{normalized_scores['D5']/10} + "
+        f"10×{normalized_scores['D6']/10} = {weighted_total}"
+    )
+
+    print(f"  ✓ {scheme_id} 返回结构、分数范围、步骤引用、总分和等级校验通过")
+    return result
+
+
+def save_task_queue(task_queue: Dict[str, Any]) -> None:
+    tmp_file = TASK_QUEUE_FILE.with_suffix(".json.tmp")
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(task_queue, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    tmp_file.replace(TASK_QUEUE_FILE)
+
+
+def update_next_task(task_queue: Dict[str, Any]) -> None:
+    next_task = next((t["id"] for t in task_queue["task_queue"] if t["status"] == "pending"), None)
+    task_queue["next_task"] = next_task
+
+
+def score_single_scheme(scheme_data: Dict[str, Any], scheme_id: str, output_dir: Path) -> Dict[str, Any] | None:
     """
-    对单个方案进行评分
-    
-    Args:
-        scheme_data: 方案数据
-        scheme_id: 方案ID
-        output_dir: 输出目录
-    
-    Returns:
-        评分结果
+    对单个方案进行评分。
     """
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"评分 {scheme_id}...")
-    print('='*60)
-    
-    # 构建prompt
-    prompt = build_scoring_prompt(scheme_data, scheme_id)
-    
-    # 调用API
+    print("=" * 60)
+
     try:
+        prompt = build_scoring_prompt(scheme_data, scheme_id)
         result = call_mimo_api(prompt)
-        
-        if result:
-            # 验证返回数据结构
-            if 'scores' not in result or 'reasons' not in result:
-                print(f"❌ {scheme_id} API返回数据格式错误：缺少scores或reasons字段")
-                return None
-            
-            if not all(f'D{i}' in result['scores'] for i in range(1, 7)):
-                print(f"❌ {scheme_id} API返回数据格式错误：scores缺少D1-D6")
-                return None
-            
-            # 添加元数据
-            result['scheme_id'] = scheme_id
-            result['run_id'] = scheme_data['run_id']
-            result['group'] = scheme_id.split('-')[0]
-            result['index'] = int(scheme_id.split('-')[1])
-            result['scored_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            result['scorer_notes'] = '深度化学推理评分 - mimo-v2.5-pro API'
-            
-            # 计算验证
-            scores = result['scores']
-            calculated_total = (
-                25 * (scores['D1'] / 10) +
-                25 * (scores['D2'] / 10) +
-                20 * (scores['D3'] / 10) +
-                10 * (scores['D4'] / 10) +
-                10 * (scores['D5'] / 10) +
-                10 * (scores['D6'] / 10)
-            )
-            
-            # 验证API返回的weighted_total
-            if 'weighted_total' not in result:
-                result['weighted_total'] = calculated_total
-            elif abs(result['weighted_total'] - calculated_total) > 0.01:
-                print(f"  ⚠️ {scheme_id} weighted_total计算不匹配，使用计算值: {calculated_total}")
-                result['weighted_total'] = calculated_total
-            
-            result['calculation'] = (
-                f"25×{scores['D1']/10} + 25×{scores['D2']/10} + 20×{scores['D3']/10} + "
-                f"10×{scores['D4']/10} + 10×{scores['D5']/10} + 10×{scores['D6']/10} = {calculated_total}"
-            )
-            
-            # 保存结果
-            group = scheme_id.split('-')[0]
-            group_dir = os.path.join(output_dir, f'{group}_group')
-            os.makedirs(group_dir, exist_ok=True)
-            
-            output_file = os.path.join(group_dir, f'{scheme_id}.json')
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            
-            print(f"✅ {scheme_id} 评分完成: 总分={result['weighted_total']}, 等级={result['grade']}")
-            return result
-        else:
-            print(f"❌ {scheme_id} 评分失败：API返回为空")
-            return None
-            
+        result = validate_and_normalize_result(result, scheme_id)
+
+        group = scheme_id.split("-")[0]
+        index = int(scheme_id.split("-")[1])
+        result["scheme_id"] = scheme_id
+        result["run_id"] = scheme_data["run_id"]
+        result["group"] = group
+        result["index"] = index
+        result["scored_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        result["scorer_notes"] = f"深度化学推理评分 - {API_MODEL} API"
+
+        group_dir = output_dir / f"{group}_group"
+        group_dir.mkdir(parents=True, exist_ok=True)
+
+        output_file = group_dir / f"{scheme_id}.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        print(f"✅ {scheme_id} 评分完成: 总分={result['weighted_total']}, 等级={result['grade']}")
+        return result
+
     except Exception as e:
         print(f"❌ {scheme_id} 评分失败：{type(e).__name__}: {e}")
-        import traceback
         traceback.print_exc()
         return None
 
 
+def load_scheme_for_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    group = task["group"]
+    index = task["index"]
+
+    scheme_file = SCHEMES_DATA_DIR / f"{group}_schemes.json"
+    with open(scheme_file, "r", encoding="utf-8") as f:
+        schemes = json.load(f)
+
+    if not 1 <= index <= len(schemes):
+        raise IndexError(f"{task['id']} 方案数据不存在")
+
+    scheme_data = schemes[index - 1]
+    actual_run_id = scheme_data.get("run_id")
+    if task.get("run_id") != actual_run_id:
+        raise ValueError(
+            f"{task['id']} run_id不匹配：队列={task.get('run_id')}，方案数据={actual_run_id}"
+        )
+
+    return scheme_data
+
+
 def main():
     """主函数：批量评分"""
-    # 路径配置
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    schemes_data_dir = os.path.join(base_dir, '03_schemes_data')
-    results_dir = os.path.join(base_dir, '04_scoring_results')
-    task_queue_file = os.path.join(base_dir, '01_task_queue.json')
-    
-    # 加载任务队列
-    with open(task_queue_file, 'r', encoding='utf-8') as f:
+    with open(TASK_QUEUE_FILE, "r", encoding="utf-8") as f:
         task_queue = json.load(f)
-    
-    # 获取待评分任务
-    pending_tasks = [t for t in task_queue['task_queue'] if t['status'] == 'pending']
+
+    pending_tasks = [t for t in task_queue["task_queue"] if t["status"] == "pending"]
     print(f"\n📋 待评分任务: {len(pending_tasks)} 个")
-    
+
     if not pending_tasks:
-        print("✅ 所有任务已完成！")
+        print("✅ 没有pending任务。若需重跑，请先重置任务队列。")
         return
-    
-    # 连续评分
+
     completed = 0
     failed = 0
-    
+
     for task in pending_tasks:
-        scheme_id = task['id']
-        group = task['group']
-        index = task['index']
-        
-        # 加载方案数据
-        scheme_file = os.path.join(schemes_data_dir, f'{group}_schemes.json')
-        with open(scheme_file, 'r', encoding='utf-8') as f:
-            schemes = json.load(f)
-        
-        if index - 1 < len(schemes):
-            scheme_data = schemes[index - 1]
-            
-            # 评分
-            result = score_single_scheme(scheme_data, scheme_id, results_dir)
-            
+        scheme_id = task["id"]
+
+        try:
+            scheme_data = load_scheme_for_task(task)
+            result = score_single_scheme(scheme_data, scheme_id, RESULTS_DIR)
+
             if result:
-                # 更新任务状态
-                task['status'] = 'completed'
+                task["status"] = "completed"
+                task["completed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                task["result_file"] = str(
+                    RESULTS_DIR / f"{task['group']}_group" / f"{scheme_id}.json"
+                )
+                task.pop("failed_at", None)
+                task.pop("error", None)
                 completed += 1
-                
-                # 保存任务队列
-                with open(task_queue_file, 'w', encoding='utf-8') as f:
-                    json.dump(task_queue, f, ensure_ascii=False, indent=2)
             else:
+                task["status"] = "failed"
+                task["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                task["error"] = "评分失败，详见控制台日志"
                 failed += 1
-                print(f"⚠️ {scheme_id} 评分失败，跳过")
-        else:
-            print(f"⚠️ {scheme_id} 方案数据不存在")
+
+        except Exception as e:
+            print(f"❌ {scheme_id} 加载或校验失败：{type(e).__name__}: {e}")
+            task["status"] = "failed"
+            task["failed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            task["error"] = f"{type(e).__name__}: {e}"
             failed += 1
-        
-        # 避免API限流，每次调用间隔2秒
-        time.sleep(2)
-    
-    # 总结
-    print(f"\n{'='*60}")
-    print(f"📊 评分完成总结")
-    print('='*60)
+
+        update_next_task(task_queue)
+        save_task_queue(task_queue)
+        time.sleep(API_INTERVAL_SECONDS)
+
+    print(f"\n{'=' * 60}")
+    print("📊 评分完成总结")
+    print("=" * 60)
     print(f"成功: {completed} 个")
     print(f"失败: {failed} 个")
     print(f"总计: {completed + failed} 个")
-    print(f"\n结果保存在: {results_dir}")
-    print(f"任务队列已更新: {task_queue_file}")
+    print(f"\n结果保存在: {RESULTS_DIR}")
+    print(f"任务队列已更新: {TASK_QUEUE_FILE}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

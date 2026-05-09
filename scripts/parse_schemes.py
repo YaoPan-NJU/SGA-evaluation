@@ -4,7 +4,14 @@
 """
 import json
 import re
-import os
+import argparse
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_INPUT_DIR = PROJECT_ROOT / "00_raw_md"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "03_schemes_data"
+GROUPS = ["A", "B", "C", "D", "E", "F"]
+
 
 def parse_md_file(filepath):
     """解析MD文件，提取所有方案"""
@@ -45,25 +52,44 @@ def parse_md_file(filepath):
     
     return results
 
-# 解析所有组
-groups = ['A', 'B', 'C', 'D', 'E', 'F']
-base_dir = 'c:/Users/15995/.qoder/test'
-output_dir = 'c:/Users/15995/.qoder/test/scoring_project/03_schemes_data'
 
-for group in groups:
-    print(f"\n解析 {group}.md...")
-    filepath = os.path.join(base_dir, f'{group}.md')
-    
-    if os.path.exists(filepath):
-        schemes = parse_md_file(filepath)
-        print(f"  ✓ 成功解析 {len(schemes)} 个方案")
-        
-        # 保存
-        output_file = os.path.join(output_dir, f'{group}_schemes.json')
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(schemes, f, ensure_ascii=False, indent=2)
-        print(f"  ✓ 已保存到 {output_file}")
-    else:
-        print(f"  ✗ 文件不存在: {filepath}")
+def main():
+    parser = argparse.ArgumentParser(description="从A-F组Markdown文件中提取方案JSON")
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        help="包含 A.md 到 F.md 的目录，默认: 项目根目录/00_raw_md",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help="输出JSON目录，默认: 项目根目录/03_schemes_data",
+    )
+    args = parser.parse_args()
 
-print("\n✅ 所有方案解析完成！")
+    input_dir = args.input_dir.resolve()
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    for group in GROUPS:
+        print(f"\n解析 {group}.md...")
+        filepath = input_dir / f"{group}.md"
+
+        if filepath.exists():
+            schemes = parse_md_file(filepath)
+            print(f"  ✓ 成功解析 {len(schemes)} 个方案")
+
+            output_file = output_dir / f"{group}_schemes.json"
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(schemes, f, ensure_ascii=False, indent=2)
+            print(f"  ✓ 已保存到 {output_file}")
+        else:
+            print(f"  ✗ 文件不存在: {filepath}")
+
+    print("\n✅ 所有方案解析完成！")
+
+
+if __name__ == "__main__":
+    main()

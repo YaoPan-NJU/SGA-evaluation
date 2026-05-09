@@ -2,13 +2,18 @@
 测试API连接
 """
 import os
+from pathlib import Path
+
 import requests
 from dotenv import load_dotenv
 
-# 加载.env文件（如果存在）
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+# 加载项目根目录下的.env文件（如果存在）
+load_dotenv(PROJECT_ROOT / ".env")
 
 API_BASE_URL = os.environ.get("MIMO_API_BASE_URL", "https://token-plan-ams.xiaomimimo.com/v1")
+API_MODEL = os.environ.get("MIMO_API_MODEL", "mimo-v2.5-pro")
 API_KEY = os.environ.get("MIMO_API_KEY", "")
 
 def test_api_connection():
@@ -30,7 +35,7 @@ def test_api_connection():
     }
     
     payload = {
-        "model": "mimo-v2.5-pro",
+        "model": API_MODEL,
         "messages": [
             {"role": "user", "content": "请回复'API连接成功'"}
         ],
